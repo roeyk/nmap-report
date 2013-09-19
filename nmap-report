@@ -1,0 +1,570 @@
+#!/usr/bin/python -u
+
+# (c) 2005- Roey Katz
+
+# libraries required:
+#   odfpy
+
+USAGE = 'Flexible NMap report re-formatter.  Usage:  %prog [options] files'
+
+history = """
+
+20120730:
+  - Revamping script
+  
+20091104:
+  - switched to scan .gnmap output exclusively... parsing is much simpler now
+  - added further constraints (skip hosts with more than N consecutive ports open or hosts with only one port open)
+  
+20091103: 
+  - started development of ODF writer
+  
+20080603:
+    
+  + Sort by host now shows OS info
+  
+20080530:
+    
+  + Finished re-factoring and transitioning off database.
+  + User can now sort output by host, os, port or generate a hostfile
+  
+  Future plans:
+    - offer an -a option to save in all formats, with different extensions?
+    - add options to constrain by IP or Port range
+    - [DONE] implement caching for ports (see getPortsPerHostDict function)
+    - [DONE] evaluate if the SQLite backend still makes sense, given its slowness relative to Python
+    - [DONE] clean up and re-factor code.  It's way too bulky.    
+      
+20080529:
+
+  * Transitioning off databasee and on to lists of Port and Host objects (implemented as dictinonaries)
+  * Re-factoring.  Currently the only visualization that works is generating hostfiles and sorting by OS.
+
+20080528:
+  + Added sorting by platform ("running")
+  + Added sorting by OS
+  + Added CSV output support for all sorting options
+  
+  Future plans:
+    - offer an -a option to save in all formats, with different extensions?
+    - add options to constrain by IP or Port range
+    - implement caching for ports (see getPortsPerHostDict function)
+    - evaluate if the SQLite backend still makes sense, given its slowness relative to Python
+    - clean up and re-factor code.  It's way too bulky.
+  
+20080522:
+  * Beginning caching efforts.  This should significantly speed up loading time, 
+    since we're not calling out to 'SELECT' SQL statements as often.
+
+20080521:  
+  + Implemented by-port and by-host selection and printing (finally)
+
+20071009:
+    
+  + migrated to SQLite backend
+  + re-modeled the NMapDB/NMapParser/NMapDBCursor classes
+
+  
+  Issues:  
+      
+  So I want to store instances of a 'host' class in my sqlite table; this
+  class contains a STRING for the IP address and a list of INTs describing
+  open TCP ports.  Am I better off storing this list in a separate table, say,
+  'TCP-192.168.3.4'?  In that case, that eliminates my ability to sift through
+  one table using 'select' all hosts with a certain port open doesn't it?
+
+  OK, so the design for the tables looks like this:
+  Port entry table:    
+      |id|hostID|portnum|port type|port state|
+  Host table:
+      |id|hostID|hostname|OS|Running|Service Info|...|
+
+"""
+
+
+import sys
+import re
+import csv
+from collections import defaultdict
+from optparse import OptionParser
+
+from odf.opendocument import OpenDocumentText
+from odf.style import Style, TextProperties, ParagraphProperties, TableColumnProperties
+from odf.text import P as ODFParagraph
+from odf.table import Table, TableColumn, TableRow, TableCell
+
+
+# -----------------------------------------------------------
+# constants
+DO_PROFILE=False
+
+
+# -----------------------------------------------------------
+# utility functions
+
+
+def uniq(lst): return tuple(set(lst))
+
+# returns a sorted list of Host instances (expects a list of Host instances)
+def sortedHostList( hostList ):
+   return sorted( uniq(hostList), key=lambda host: map(int, host[0].split('.')) )
+
+# detect a consecutive port range, given a threshold after which to stop counting
+# for testing its speed, use detectConsecutiveSequence( [random.randint(1,65536) for x in xrange(100000)], thresholdCount=2)
+# from 'arkanes_' on irc://irc.freenode.net/#python on Tuesday 20091103
+# this is the fastest of the detectConsecutiveSequence functions
+def detectConsecutiveSequence( portList, thresholdCount ):
+     ports = iter(portList)
+     firstport = ports.next()
+     count = 1
+     for port in ports:
+         if port == firstport+1:
+             count += 1
+             if count >= thresholdCount:
+                 return True
+         else:
+             firstport = port
+             count = 1
+     return False
+
+
+# -----------------------------------------------------------
+# class definitions
+
+class ODFTable:
+    PWENC = "utf-8"
+    
+    def __init__(self, outputFilename, orderType='p'):
+        self.outputFilename = outputFilename
+        self.orderType = orderType
+        self.table = None
+        self.finding = 1
+        
+        self.initializeDocument()
+
+    def initializeDocument( self ):
+      
+	self.textdoc = OpenDocumentText()
+        self.findingCount = 1
+        
+	# Create a style for the table content. One we can modify
+	# later in the word processor.
+	self.tablecontents = Style(name="Table Contents", family="paragraph")
+	self.tablecontents.addElement(ParagraphProperties(numberlines="false", linenumber="0"))
+	self.textdoc.styles.addElement(self.tablecontents)
+        
+        
+        # ----------------- define a few styles --------------------
+        
+        # normal table cell style
+        self.NormalStyle = self.tablecontents        
+        
+        # a Bold style
+        self.BoldStyle = Style(name="Bold", family="paragraph")
+        self.BoldProp = TextProperties(fontweight="bold")
+        self.BoldStyle.addElement(self.BoldProp)
+        self.textdoc.automaticstyles.addElement(self.BoldStyle)
+        
+            # Quick sample usage example:
+            # h=H(outlinelevel=1, stylename=h1style, text="My first text")
+            # textdoc.text.addElement(h)
+            # p = P(text="Hello world. ")
+            # boldpart = Span(stylename=boldstyle, text="This part is bold. ")
+        
+	# Create automatic styles for the column widths.
+	# We want two different widths, one in inches, the other one in metric.
+	# ODF Standard section 15.9.1
+	widthshort = Style(name="Wshort", family="table-column")
+	widthshort.addElement(TableColumnProperties(columnwidth="1.7cm"))
+	self.textdoc.automaticstyles.addElement(widthshort)
+
+	widthwide = Style(name="Wwide", family="table-column")
+	widthwide.addElement(TableColumnProperties(columnwidth="1.5in"))
+	self.textdoc.automaticstyles.addElement(widthwide)
+
+	# Start the table and describe the columns
+	self.table = Table()
+	if self.orderType=='p':
+	    self.table.addElement(TableColumn(numbercolumnsrepeated=6,stylename=widthwide))
+
+        # populate columns with headers...
+        tr = TableRow()
+        self.table.addElement(tr)
+        
+        # declare necessary vars
+        tc1 = TableCell(); tc2 = TableCell(); tc3 = TableCell(); tc4 = TableCell(); tc5 = TableCell(); tc6 = TableCell();
+        addElem = lambda cell, text, s=self: cell.addElement(ODFParagraph(stylename=self.BoldStyle, text=unicode(text, ODFTable.PWENC)))
+
+        # Add Column 1: Finding Number
+        tc1.addElement( ODFParagraph(stylename=self.BoldStyle, text=unicode("Finding Number", ODFTable.PWENC)))        
+        tr.addElement(tc1)
+
+        # Add Column 2: Vulnerability Description
+        tc2.addElement( ODFParagraph(stylename=self.BoldStyle, text=unicode("Port Description", ODFTable.PWENC)))                
+        tr.addElement(tc2)
+        
+        # Add Column 3: 800-53 Mapping
+#        tc3.addElement( ODFParagraph(stylename=self.BoldStyle, text=unicode("800-53 Mapping", ODFTable.PWENC)))                        
+#        tr.addElement(tc3)        
+        
+        # Add Column 4: Implication (leave empty)
+#        tc4.addElement( ODFParagraph(stylename=self.BoldStyle, text=unicode("Implication", ODFTable.PWENC)))                                
+#        tr.addElement(tc4)
+        
+        # Add Column 5: Recommendation
+#        tc5.addElement( ODFParagraph(stylename=self.BoldStyle, text=unicode("Recommendation", ODFTable.PWENC)))                                        
+#        tr.addElement(tc5)
+        
+        # Add Column 6: Hosts Affected
+        tc6.addElement( ODFParagraph(stylename=self.BoldStyle, text=unicode("Hosts Affected", ODFTable.PWENC)))
+        tr.addElement(tc6)
+        
+        
+
+    # print ODF table entry for a port and a list of hosts which have it open
+    # note, 'hosts' is a string and is not parsed any further
+    def printODFEntry( self, ports, hosts ): # ports and hosts are both lists of tuples
+
+        # print header
+
+        tr = TableRow()
+        self.table.addElement(tr)
+
+        tc1 = TableCell(); tc2 = TableCell(); tc3 = TableCell(); tc4 = TableCell(); tc5 = TableCell(); tc6 = TableCell();
+        
+        addElem = lambda cell, text, s=self: cell.addElement(ODFParagraph(stylename=s.tablecontents, text=unicode(text, ODFTable.PWENC)))
+
+        # Populate Column 1: Finding Number
+        addElem(tc1, "%s.  " % (self.findingCount,))
+        tr.addElement(tc1)
+        
+        # increment the findings count (goes into first column)
+        self.findingCount+=1
+
+        # Populate Column 2: Port Description (prepended with port# and service name)
+        #  note: can contain any number of entries.  They'll all be appended together.
+#        print 'len(ports)=%d' % len(ports)
+        for p in ports:
+            
+          (portnum,pstate,ptype,svcname) = p
+            
+          #  construct a port description string
+          portString = '\n%s/%s (%s)' % (portnum, ptype, svcname)
+          
+          #  describe the port string more 
+#          descriptionString = portString#'a %s service was found listening on this host.' % svcname
+          tc2.addElement( ODFParagraph(stylename=self.BoldStyle, text=unicode( portString, ODFTable.PWENC)) )
+#          tc2.addElement( ODFParagraph(stylename=self.NormalStyle, text=unicode(descriptionString, ODFTable.PWENC)) )
+          tr.addElement(tc2)
+          
+#          print 'constructed port description statement: %s' % descriptionString
+        
+        # Populate Column 3: 800-53 Mapping (leave this empty though)
+#        addElem(tc3, '')
+#        tr.addElement(tc3)                
+
+        # Populate Column 4: Implication
+#        implicationString = 'There is no specific vulnerability associated with this service, however, some services are known to have harbored vulnerabilities in the past.'
+#        tc4.addElement( ODFParagraph(stylename=self.NormalStyle, text=unicode(implicationString, ODFTable.PWENC)) )        
+#        tr.addElement(tc4)
+        
+        # Populate  Column 5: Recomendation
+#        recommendationString = 'The case for these services should be reviewed; if they are not needed, they should be disabled.'
+#        tc5.addElement( ODFParagraph(stylename=self.NormalStyle, text=unicode(recommendationString, ODFTable.PWENC)) )
+#        tr.addElement(tc5)                
+
+        # Populate Column 6: IP Addresses (i.e. hosts with this port open)
+        #  note: can contain any nymber of entries.  They'll all be appended together.
+        
+        addElem(tc6, '\n'.join( ('%s %s' % (hostip, '('+hostname+')' if hostname else '')) for (hostip,hostname) in hosts)  )
+        tr.addElement(tc6)
+        
+#        print 'added host=%s, ports=%s' % (hosts[0:3], ports[0:3])
+
+    def saveAndClose( self ):
+        self.textdoc.text.addElement( self.table )
+        self.textdoc.save(self.outputFilename)
+
+        
+
+# holds information about a single host
+class Host:
+    def __init__(self, _hostip, _hostname):
+        self.hostip = _hostip
+        self.hostname = _hostname
+
+# holds information about a single port 
+class Port:
+    def __init__( self, _portnum, _pstate,_ptype, _svcname ):
+        self.portnum = int(_portnum)
+        self.ptype = _ptype
+        self.state = _pstate
+        self.svcname = _svcname
+
+# parse a single line of (well-formed) greppable NMap output (.gnmap) and return Host and (Port,)     
+def parseLine(line):
+    
+    # split up the initial line
+    (hostip, hostname, portstring) = re.match(r'Host:\s+(.*)\s+\((.*)\)\s+Ports:\s+(.*)', line).groups()
+ 
+    # parse hostip/name info
+    ports=re.findall(r'(\d+)/(\w+)/(\w+)//(\w+)///', portstring)
+
+    # done
+    a = ( hostip,hostname,ports ) 
+    return a
+
+
+
+
+# Stores NMap results
+class NMapDB:
+
+    def __init__( self, filenames ):  # note: db is either an NMapDB or None
+    
+        # create new database
+        self.hostDB = {}  # dictionary with Host objects as keys and lists of Port tuples as values
+        self.portDB = {}  # dictionary with Port tuples as keys and lists of Host objects as values
+        
+        # load database
+        self.loadFiles( filenames )
+        
+
+    # utility functions
+    def getHostDB(self): return self.hostDB
+    def getPortDB(self): return self.portDB
+    def getHosts(self): return self.hostDB.keys()
+    def getPorts(self): return self.portDB.keys()
+        
+    # Load and parse multiple NMap greppable output (.gnmap) files given a list of filenames 
+    def loadFiles( self, fnames ):
+        for fn in fnames:
+            self.loadFile( fn )
+            
+    # Load and parse an NMap greppable output file and add its contents to internal database
+    def loadFile( self, fname, exclusionThreshold=100):
+        for line in open(fname):
+            
+            # disqualify bad lines--on't feed the parser rubbish
+            if not line.startswith('Host:'): continue
+            if not line.find('Status:')==-1: continue
+            
+            # host is a Host object; portList is a list of Port objects
+            (hostip,hostname,portList) = parseLine( line )
+            
+            _portList=uniq(portList)
+            portList=_portList            
+
+            # weed out bad entries
+            if len(portList)==0: 
+#                print 'loadFile: hostip=%s; empty port list; not adding' % (hostip)
+                continue
+            elif len(portList)==1 and int(portList[0][0])==80:
+
+#                print 'loadFile: hostip=%s; No ports open; not adding' % hostip
+                continue            
+            elif detectConsecutiveSequence( (int(p[0]) for p in portList), exclusionThreshold ):
+#                print 'loadFile: hostip=%s; Only one port open; not adding' % hostip
+                continue
+
+
+            # add to ports hash table
+            portsAdded=0
+            for p in portList:
+                
+              if not p[1]=='open': 
+#                  print 'host=%s, port=%s; got closed/filtered port, ignoring port' % (hostip,p)
+                  continue                  
+              
+              if not self.portDB.has_key( p ):
+                  self.portDB[p] = []
+                  
+              self.portDB[ p ].append( (hostip,hostname) )
+              portsAdded += 1
+              
+            if portsAdded==0:
+#                print 'loadFile(): host %s appears to have no open ports; ignoring' % hostip
+                continue            
+              
+            # add to hosts hash table
+            self.hostDB[ (hostip,hostname) ] = portList
+            
+
+
+        
+# given NmapDB and optparse instance, this dispatches to the appropriate output function
+def parseAndDisplayFile( nmapdb, options, odfTable=None ):
+
+    # holds our services from /etc/services or alternate
+    services={}
+    
+    # build dispatch table
+    funcTable = {
+      'g':displayHostFile,
+      'p':displaySortedByPort,
+      'h':displaySortedByHost
+      }
+
+    # open up a comma-separated-value writer
+    csvWriter = csv.writer(sys.stdout)
+
+    # display the results according t                       o user-specified order    
+    funcTable[options.orderType]( nmapdb, csvWriter, options, odfTable )
+
+    
+
+# Hostfile listing:  Display just a list of hosts, one per line
+def displayHostFile( nmapdb, csvWriter, options, odfTable=None ):
+
+    # and sort list of hosts
+    _hostList = nmapdb.getHosts()
+    hostIPs = [ host[0] for host in sortedHostList(_hostList) ]
+
+    # display
+    for hostip in hostIPs:
+        print hostip
+
+        
+# Order by port:  User wants list of all ports and the hosts who have them open
+def displaySortedByPort( nmapdb, writer, options, odfTable=None ):
+
+    # get the ports:hosts dict
+    portToHostsDict = nmapdb.getPortDB()
+    
+    # sort ports list along port number (first element of the (portnum,pstate,...) tuple)
+    sortedPortList = sorted( portToHostsDict.keys(), key=lambda p:int(p[0]) )
+    
+    # for every port in the ports dictionary...
+    for (portnum,pstate,ptype,svcname) in sortedPortList:
+        
+        # quickly sort hosts list along IP address
+        hostList = sortedHostList( portToHostsDict[ (portnum,pstate,ptype,svcname) ] )
+
+        # build the hosts list string
+        hostListString = ',  '.join("%s%s" % (host[0],' ('+host[1]+')' if host[1] else '') for host in hostList)
+        
+        # print it to CSV or normal output
+        if options.outputCSV:
+            writer.writerow([portnum, ptype, svcname] + [h[0] for h in hostList])
+        if options.outputODF:
+            odfTable.printODFEntry( [(portnum,pstate,ptype,svcname)], hostList )
+        else:
+            print "%5.5s/%-5.5s %s  %s" % (portnum,ptype,' (%5.10s'%svcname+')' if svcname else '',hostListString)
+            
+# MakeAutoHostfiles: User wants a directory of hostfiles for systems sharing common properties
+# (OS, ports, etc)
+def makeAutoHostfiles( nmapdb ):
+    pass
+
+
+# Order by host:  User wants list of hosts and list of ports each host has open
+def displaySortedByHost( nmapdb, writer, options, odfTable=None ):
+
+    # fetch list of ports and hosts
+    hostList = nmapdb.getHosts()
+    hosts = nmapdb.getHostDB()
+
+    sortedHosts = sortedHostList( hostList )#sorted( hostList, key=lambda h:h[1] )
+    
+
+    # for every host in the host dictionary...
+    for (hostip,hostname) in sortedHosts:
+
+        # fetch the port list for that host
+        portList = hosts[ (hostip,hostname) ]
+
+        # quickly sort port list along IP address        
+        portList = sorted( uniq(portList), key=lambda p:p[0]  )
+        
+        # build the ports list string 
+        portListString = ',  '.join("%s/%s (%s)" % (portnum,ptype,svcname) for (portnum,pstate,ptype,svcname) in portList)
+        
+        # print it to CSV or normal output
+        if options.outputCSV:
+            writer.writerow([hostip] + [p[0] for p in portList] )
+        if options.outputODF:
+            odfTable.printODFEntry( portList, [(hostip,hostname)])
+        else:
+            print "%15.15s %-20.20s %s" % (hostip, '(None):' if not hostname else '(' + hostname + '):', portListString)
+
+            
+
+
+# --------------------------------------------------------
+# user-interface
+
+def parseArgs( argv ):
+    """parseArgs(list of args) -> (dictionary of values, list leftover arguments)
+    
+       Takes a list of parameters (such as sys.argv) and returns a tuple containing a dictionary of keyword arguments and a list of non-keyword arguments.
+    """
+    
+    parser = OptionParser(usage=USAGE)
+    
+    # flag; false by default
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose", default=False, 
+                                    help="do not display hosts which have no ports open")
+    
+    # choice
+    parser.add_option("-s", "--sort-by", type="choice", action="store", choices=["p","h","g","o", "r"], default="p", dest="orderType",
+              help="specify sorting priority (by [p]ort, [h]ost, [r]unning platform, [o]perating system or [g]enerate hostfile)")
+    parser.add_option("-k", "--skip-empty",  action="store_true", dest="skipEmpty", 
+              help="skip empty hosts")
+    parser.add_option("-P", "--port-list", action="store", dest="portList", help="display only hosts with these specific ports open")
+    parser.add_option("-H", "--host-list", action="store", dest="hostList", help="display only specific hosts")
+    parser.add_option("-V", "--show-services", action="store_true", dest="showServiceNames", help="show service names after port numbers")
+    parser.add_option("-c", "--output-csv", action="store_true", dest="outputCSV", help="output CSV-formatted text")
+    parser.add_option("-f", "--output-odf", type="string", action="store", dest="outputODF", help="output to this file in ODF format", default="")
+    parser.add_option("-o", "--os-detection", type="string", action="store", dest="osDetectionString", help="Only show hosts that display this OS string regex")
+    parser.add_option("-x", "--prune-proxied-threshold", action="store", dest="pruneProxiedThreshold", help="prune hosts with this many consecutively-numbered ports open", default=0)
+    parser.add_option("-1", "--prune-single-port-hosts", action="store_true", dest="pruneSinglePortHosts", help="prune hosts with only one port open", default=False)
+
+        
+    (options, args) = parser.parse_args()              
+              
+    if options.orderType: options.orderType = options.orderType.lower()
+    
+    if options.pruneProxiedThreshold:
+        options.pruneProxiedThreshold = int( options.pruneProxiedThreshold )
+
+    return (options,args)
+
+
+# ---------------------------------------------------------
+# main
+
+def main():
+    
+    odfTable=None
+    
+    # parse arguments
+    options, files = parseArgs( sys.argv )
+
+    # create ODFTable to populate if the user requested it
+    if options.outputODF:
+        odfTable = ODFTable( options.outputODF ) # outputODF holds the filename
+
+    # parse NMap logs
+    results = NMapDB( files )
+    parseAndDisplayFile(  results, options, odfTable )
+
+    # close ODFTable if we created one
+    if odfTable:
+        odfTable.saveAndClose()
+    
+
+
+
+# ---------------------------------------------------------
+# outside of main (debug, profile, etc.)
+
+if __name__=='__main__':
+    if DO_PROFILE:    
+        import hotshot
+        prof  =  hotshot.Profile("hotshot_nmap_report_experimental_stats")
+        prof.runcall(main)
+        prof.close()
+    else:
+        main()
+    
+    
