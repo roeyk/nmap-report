@@ -408,7 +408,7 @@ def parseAndDisplayFile( nmapdb, options, odfTable=None ):
     # open up a comma-separated-value writer
     csvWriter = csv.writer(sys.stdout)
 
-    # display the results according t                       o user-specified order    
+    # display the results according to user-specified order
     funcTable[options.orderType]( nmapdb, csvWriter, options, odfTable )
 
     
